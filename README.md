@@ -12,13 +12,12 @@ the near future. A Swing visualizer shows every decision live.
 ![The visualizer during a run: task graph, workers, benchmark and Gantt chart](docs/images/visualizer-mid-run.png)
 
 ## Highlights
-
-- **Data structures:** an adjacency-list DAG, two binary heaps (the ready queue keyed by task priority, and busy
-  workers keyed by finish time), a FIFO queue of idle workers, hash maps for O(1) lookup by ID, and a compact,
-  array-based graph copy for fast simulation (details in [Data structures](#data-structures)).
 - **Algorithms:** Kahn's topological sort with cycle detection, critical-path dynamic programming in reverse
   topological order, reachability analysis, an event-driven simulation loop, and a rollout look-ahead with a
   provable makespan lower bound.
+- **Data structures:** an adjacency-list DAG, two binary heaps (the ready queue keyed by task priority, and busy
+  workers keyed by finish time), a FIFO queue of idle workers, hash maps for O(1) lookup by ID, and a compact,
+  array-based graph copy for fast simulation (details in [Data structures](#data-structures)).
 - **Layered architecture:** the scheduling engine has no dependency on the UI. The visualizer and the benchmark
   use the same public `Controller` API.
 - **Measured results:** the scheduler ties or beats six baseline strategies on all 10 built-in projects. On 800
