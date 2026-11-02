@@ -3,7 +3,7 @@ package benchmark;
 public enum BenchmarkStrategy {
     ADAPTIVE(
             "Adaptive Scheduler",
-            "The project's full static + dynamic scoring and look-ahead scheduler."
+            "The project's full scheduler: static + dynamic scoring with a rollout look-ahead on contested decisions."
     ),
     SHORTEST_TASK_FIRST(
             "Shortest Task First",

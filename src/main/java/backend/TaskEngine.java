@@ -13,6 +13,10 @@ public class TaskEngine {
     private int maxDuration;
     private int maxOpenChild;
 
+    // Rollout lookahead settings (validated in research/phase-reports/PHASE1_REPORT.md section 7 and PHASE2_REPORT.md section 6)
+    private static final int LOOKAHEAD_CANDIDATES = 5;
+    private static final int ROLLOUT_DEPTH = 8;
+    private DynamicScoreLogic.RolloutModel rolloutModel;
 
     public TaskEngine(LinkedList<Task> tasks){
         this.tasks = tasks;
@@ -138,42 +142,17 @@ public class TaskEngine {
 
         GraphTaskNode selected = tasksAr[0];
 
+        // Lookahead: a makespan rollout, used only on contested decisions
+        // (more ready tasks than workers able to start one right now).
         if (tasksAr[1] != null
-                && readyPQ.size() <= workersNum
-                && Math.abs(scores[1] - scores[0]) > 0.1) {
+                && originalPQSize > freeWorkersNow(employed, unemployed, globalTime)) {
 
-            PriorityQueue<GraphTaskNode> pqForFirst =
-                    buildSimulationReadyQueue(tasksAr[0], tasksAr);
+            selected = rolloutLookahead(tasksAr, employed, unemployed, globalTime);
 
-            double score0 =
-                    scores[0]
-                            + new DynamicScoreLogic().makeLookAhead(
-                            tasksAr[0],
-                            pqForFirst,
-                            employed,
-                            unemployed,
-                            workersNum,
-                            globalTime
-                    );
-
-            PriorityQueue<GraphTaskNode> pqForSecond =
-                    buildSimulationReadyQueue(tasksAr[1], tasksAr);
-
-            double score1 =
-                    scores[1]
-                            + new DynamicScoreLogic().makeLookAhead(
-                            tasksAr[1],
-                            pqForSecond,
-                            employed,
-                            unemployed,
-                            workersNum,
-                            globalTime
-                    );
-
-            selected =
-                    score0 >= score1
-                            ? tasksAr[0]
-                            : tasksAr[1];
+            if (selected != tasksAr[0] && selected != tasksAr[1] && selected != tasksAr[2]) {
+                // chosen from beyond the three polled candidates: take it out of the queue
+                readyPQ.remove(selected);
+            }
         }
 
         for (GraphTaskNode candidate : tasksAr) {
@@ -200,6 +179,70 @@ public class TaskEngine {
         }
 
         return simulationPQ;
+    }
+
+    /**
+     * Rollout lookahead. Compares the three blended-score candidates and the next
+     * best ready tasks by static score (LOOKAHEAD_CANDIDATES in total). Each one is
+     * started now in a simulation that continues for ROLLOUT_DEPTH completion
+     * events; the smallest estimated makespan wins, and ties keep the order above
+     * (so the blended-score choice wins every tie). The ready queue is not changed.
+     */
+    private GraphTaskNode rolloutLookahead(
+            GraphTaskNode[] candidates,
+            PriorityQueue<Worker> employed,
+            Queue<Worker> unemployed,
+            int globalTime) {
+
+        if (rolloutModel == null) {
+            rolloutModel = new DynamicScoreLogic.RolloutModel(getTopologicalSort());
+        }
+
+        List<GraphTaskNode> compared = new ArrayList<>();
+        for (GraphTaskNode candidate : candidates) {
+            if (candidate != null) {
+                compared.add(candidate);
+            }
+        }
+        // further candidates come from a copy, so readyPQ itself stays untouched
+        PriorityQueue<GraphTaskNode> rest = new PriorityQueue<>(readyPQ);
+        while (compared.size() < LOOKAHEAD_CANDIDATES && !rest.isEmpty()) {
+            compared.add(rest.poll());
+        }
+
+        DynamicScoreLogic logic = new DynamicScoreLogic();
+        GraphTaskNode best = null;
+        int bestMakespan = Integer.MAX_VALUE;
+        for (GraphTaskNode candidate : compared) {
+            PriorityQueue<GraphTaskNode> otherReady =
+                    buildSimulationReadyQueue(candidate, candidates);
+            otherReady.remove(candidate);
+
+            int makespan = logic.rolloutMakespan(
+                    rolloutModel,
+                    candidate,
+                    otherReady,
+                    employed,
+                    unemployed.size(),
+                    globalTime,
+                    ROLLOUT_DEPTH);
+            if (makespan < bestMakespan) {
+                best = candidate;
+                bestMakespan = makespan;
+            }
+        }
+        return best;
+    }
+
+    /** Workers able to start a task at globalTime: the deciding one, idle ones, and ones finishing now. */
+    private int freeWorkersNow(PriorityQueue<Worker> employed, Queue<Worker> unemployed, int globalTime) {
+        int free = 1 + unemployed.size();
+        for (Worker worker : employed) {
+            if (worker.getTaskEstimatedEndTime() == globalTime) {
+                free++;
+            }
+        }
+        return free;
     }
 
     private void dynamicScoreChoose

@@ -1,0 +1,1241 @@
+diff --git a/README.md b/README.md
+index de13245..4507cbe 100644
+--- a/README.md
++++ b/README.md
+@@ -192,4 +192,27 @@ The project is primarily an exploration of a classic scheduling question:
+ 
+ When several tasks are ready, which one should be executed now in order to improve the schedule as a whole?
+ 
+-Rather than using a fixed greedy rule, the system combines dependency-graph structure with the current execution state to make that decision dynamically.
+\ No newline at end of file
++Rather than using a fixed greedy rule, the system combines dependency-graph structure with the current execution state to make that decision dynamically.
++
++Configuration and Experiments
++
++All scoring weights, lookahead variants (including a rollout lookahead) and event-handling options are exposed through backend.SchedulerConfig; SchedulerConfig.DEFAULT reproduces the original scheduler exactly (verified by GoldenTraceTest).
++
++Reproducible benchmark experiments: benchmark.ExperimentRunner (instances from benchmark.InstanceGenerator, exact optima from benchmark.ExactSolver). Results and methodology are documented in PHASE1_REPORT.md.
++
++Optimized Presets (Phase 2)
++
++Three opt-in presets are available; SchedulerConfig.DEFAULT is unchanged and remains the default.
++
++SchedulerConfig.PHASE1_ROLLOUT: the Phase 1 rollout configuration with the original weights.
++SchedulerConfig.FAST_OPTIMIZED: no lookahead, learned weights; about 2x faster than the original, makespan GM 0.9907 vs original on the 4,500-instance test set (quality equal to plain critical-path-first).
++SchedulerConfig.QUALITY_OPTIMIZED: the rollout with learned weights; makespan GM 0.9885 vs original and 0.9986 vs PHASE1_ROLLOUT on the same test set, at about 1x the original's single-thread runtime on 10-30-task graphs, 4-7x on 31-600-task graphs and about 29x on 601-1,500-task graphs.
++
++Usage: new Controller(tasks, workerNames, printShutdownSummary, SchedulerConfig.QUALITY_OPTIMIZED).
++
++Methodology, all results and limitations are in PHASE2_REPORT.md. To reproduce the optimization (about 4 hours on 12 threads; each stage resumes from target/phase2/run1/evaluations.csv):
++
++mvn -o compile
++java -Xmx4g -cp target/classes benchmark.WeightOptimizer <stage> target/phase2/run1 12
++
++with <stage> in order: datasets, sobol, trackA, raceA, trackB, raceB, validation, test, timing, reproduce. The test stage refuses to run a second time in the same directory.
+diff --git a/src/main/java/backend/Controller.java b/src/main/java/backend/Controller.java
+index fd8be4a..780c8e6 100644
+--- a/src/main/java/backend/Controller.java
++++ b/src/main/java/backend/Controller.java
+@@ -14,6 +14,7 @@ public class Controller {
+     private int tasksLeft;
+     private int tasksCompleted;
+     private final boolean printShutdownSummary;
++    private final SchedulerConfig config;
+ 
+ 
+ 
+@@ -25,8 +26,30 @@ public class Controller {
+             LinkedList<Task> tasks,
+             LinkedList<String> workersName,
+             boolean printShutdownSummary) {
++        this(tasks, workersName, printShutdownSummary, SchedulerConfig.DEFAULT);
++    }
++
++    public Controller(
++            LinkedList<Task> tasks,
++            LinkedList<String> workersName,
++            boolean printShutdownSummary,
++            SchedulerConfig config) {
++        this(tasks, workersName, printShutdownSummary, config, null);
++    }
++
++    /**
++     * @param analysis precomputed static analysis of exactly {@code tasks}, reused
++     *                 across runs with different configurations; null computes it
++     */
++    public Controller(
++            LinkedList<Task> tasks,
++            LinkedList<String> workersName,
++            boolean printShutdownSummary,
++            SchedulerConfig config,
++            StaticGraphAnalysis analysis) {
+ 
+-        this.taskEngine = new TaskEngine(tasks);
++        this.config = config;
++        this.taskEngine = new TaskEngine(tasks, config, analysis);
+         this.workerManager = new WorkerManager(workersName);
+         this.globalTime = 0;
+         this.workersNum = workerManager.getSize();
+@@ -65,7 +88,7 @@ public class Controller {
+             }
+         }
+         LinkedList<Task> newList = taskEngine.prepareAdd(taskToAdd, IDsOfChildren);
+-        TaskEngine newGraph = new TaskEngine(newList);
++        TaskEngine newGraph = new TaskEngine(newList, config);
+         newGraph.initial();
+         if (!(newGraph.getTopologicalSortSize() == newList.size())) {
+             throw new RuntimeException("cycle created, illegal task to add");
+@@ -96,7 +119,7 @@ public class Controller {
+             throw new RuntimeException("this task is in progress");
+         }
+         LinkedList<Task> newTasks = taskEngine.prepareRemove(taskToRemove);
+-        TaskEngine newGraph = new TaskEngine(newTasks);
++        TaskEngine newGraph = new TaskEngine(newTasks, config);
+         this.taskEngine = newGraph;
+         taskEngine.initial();
+         LinkedList<Worker> workers = workerManager.getEmploymentsAsList();
+@@ -134,6 +157,11 @@ public class Controller {
+             throw new RuntimeException("All tasks completed");
+         }
+ 
++        if (config.getCompletionMode() == SchedulerConfig.CompletionMode.BATCHED) {
++            finishAllAtNextCompletionTime();
++            return;
++        }
++
+         Worker worker = workerManager.getTopEmployed();
+         GraphTaskNode currentFinish = worker.getDesk();
+ 
+@@ -177,6 +205,46 @@ public class Controller {
+         addUnemployed();
+     }
+ 
++    /**
++     * BATCHED mode: every worker whose task ends at the earliest end time finishes
++     * first, so all newly ready tasks are known before anyone is given new work.
++     */
++    private void finishAllAtNextCompletionTime() {
++        List<Worker> finished = new ArrayList<>();
++        Worker first = workerManager.getTopEmployed();
++        globalTime = first.getTaskEstimatedEndTime();
++        finished.add(first);
++        while (!workerManager.getEmploymentsQ().isEmpty()
++                && workerManager.getNextEndTime() == globalTime) {
++            finished.add(workerManager.getTopEmployed());
++        }
++
++        for (Worker worker : finished) {
++            GraphTaskNode currentFinish = worker.getDesk();
++            worker.finishTask(globalTime);
++            taskEngine.taskCompleted(currentFinish);
++            tasksLeft--;
++            tasksCompleted++;
++        }
++
++        for (Worker worker : finished) {
++            if (worker.getToRemove()) {
++                workerManager.delete(worker);
++                System.out.println("worker removed");
++                workersNum--;
++            } else {
++                workerManager.giveNewTask(worker, null);
++            }
++        }
++
++        if (tasksLeft == 0) {
++            SHUTDOWN();
++            return;
++        }
++
++        addUnemployed();
++    }
++
+     private void SHUTDOWN() {
+         if (!printShutdownSummary) {
+             return;
+@@ -305,6 +373,10 @@ public class Controller {
+         return tasksCompleted;
+     }
+ 
++    public SchedulerConfig getConfig() {
++        return config;
++    }
++
+     // === Tasks for UI ===
+     public Collection<GraphTaskNode> getAllTasks() {
+         return taskEngine.getTopologicalSort();
+diff --git a/src/main/java/backend/DynamicScoreLogic.java b/src/main/java/backend/DynamicScoreLogic.java
+index 362ff4f..dec4b3c 100644
+--- a/src/main/java/backend/DynamicScoreLogic.java
++++ b/src/main/java/backend/DynamicScoreLogic.java
+@@ -1,12 +1,25 @@
+ package backend;
+ 
+ import java.util.ArrayDeque;
++import java.util.Arrays;
++import java.util.Collection;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.PriorityQueue;
+ import java.util.Queue;
+ 
+ public class DynamicScoreLogic { // חייב ליצור מקס דיוריישן ומקס סטטיק סקור שנוכל לתת לפונקציה  (בבנייה)
+ 
++    private final SchedulerConfig config;
++
++    public DynamicScoreLogic() {
++        this(SchedulerConfig.DEFAULT);
++    }
++
++    public DynamicScoreLogic(SchedulerConfig config) {
++        this.config = config;
++    }
++
+     public double makeDynamicScore(
+             GraphTaskNode task,
+             int PQSize,
+@@ -14,7 +27,24 @@ public class DynamicScoreLogic { // חייב ליצור מקס דיוריישן
+             double maxStaticScore,
+             int maxDuration,
+             int maxOpenChild){
++        return makeDynamicScore(task, PQSize, workerNum, maxStaticScore, maxDuration, maxOpenChild, workerNum);
++    }
++
++    /**
++     * @param availableWorkers workers able to start a task now; replaces workerNum
++     *                         in the workload pressure alpha = min(1, ready / workers)
++     *                         when SchedulerConfig.isWorkloadUsesAvailableWorkers()
++     */
++    public double makeDynamicScore(
++            GraphTaskNode task,
++            int PQSize,
++            int workerNum,
++            double maxStaticScore,
++            int maxDuration,
++            int maxOpenChild,
++            int availableWorkers){
+ 
++        int loadWorkers = config.isWorkloadUsesAvailableWorkers() ? Math.max(1, availableWorkers) : workerNum;
+         int openChildren = openChildrenCount(task);
+ 
+         double childrenToPQ =
+@@ -22,7 +52,7 @@ public class DynamicScoreLogic { // חייב ליצור מקס דיוריישן
+                         task,
+                         openChildren,
+                         PQSize,
+-                        workerNum,
++                        loadWorkers,
+                         maxOpenChild);
+ 
+         double openToBlock = openToBlockRatio(task);
+@@ -35,9 +65,10 @@ public class DynamicScoreLogic { // חייב ליצור מקס דיוריישן
+             childImportance = openChildrenImportance(task) / (openChildren * maxStaticScore);
+         }
+ 
+-        double durationToReady = durationToRPQSize(task, maxDuration, PQSize,workerNum);
+-        return 0.2*openToBlock + 0.1*openChildrenScore +
+-                0.15*childImportance + 0.3*durationToReady + 0.25*childrenToPQ;
++        double durationToReady = durationToRPQSize(task, maxDuration, PQSize,loadWorkers);
++        return config.getOpenToBlockWeight()*openToBlock + config.getOpenChildrenWeight()*openChildrenScore +
++                config.getChildImportanceWeight()*childImportance + config.getDurationToReadyWeight()*durationToReady
++                + config.getChildrenToReadyQueueWeight()*childrenToPQ;
+     }
+ 
+     public double makeLookAhead(
+@@ -62,7 +93,8 @@ public class DynamicScoreLogic { // חייב ליצור מקס דיוריישן
+                         PQ,
+                         employed,
+                         unemployed,
+-                        globalTime)
++                        globalTime,
++                        config.isSimulationAssignsIdleWorkers())
+                         / maxUnemployment);
+ 
+         return unemploymentInDurationScore;
+@@ -130,12 +162,33 @@ public class DynamicScoreLogic { // חייב ליצור מקס דיוריישן
+             PriorityQueue<Worker> workersPQ,
+             Queue<Worker> unEmployed,
+             int globalTime
++    ) {
++        return unemploymentInDuration(task, readyPQ, workersPQ, unEmployed, globalTime, false);
++    }
++
++    /**
++     * @param assignIdleAtStart if true, idle workers take available ready tasks at
++     *                          globalTime, as Controller.addUnemployed does; the
++     *                          original simulation (false) first waits for the
++     *                          next completion of a busy worker
++     */
++    public static double unemploymentInDuration(
++            GraphTaskNode task,
++            PriorityQueue<GraphTaskNode> readyPQ,
++            PriorityQueue<Worker> workersPQ,
++            Queue<Worker> unEmployed,
++            int globalTime,
++            boolean assignIdleAtStart
+     ) {
+         int totalUnemployment = 0;
+ 
+         PriorityQueue<GraphTaskNode> copyTasksPQ = new PriorityQueue<>(readyPQ);
+         PriorityQueue<Worker> copyWorkerPQ = new PriorityQueue<>(workersPQ);
+-        Queue<Worker> copyUnemployedQ = new ArrayDeque<>(unEmployed);
++        // Copies, so that the simulation never writes into the real idle workers.
++        Queue<Worker> copyUnemployedQ = new ArrayDeque<>();
++        for (Worker worker : unEmployed) {
++            copyUnemployedQ.add(new Worker(worker));
++        }
+         int nextWorkerTime = globalTime;
+         int endOfTaskTime = nextWorkerTime + task.getDuration();
+         HashMap<Integer, GraphTaskNode> simulateIDTable = new HashMap<>();
+@@ -144,6 +197,15 @@ public class DynamicScoreLogic { // חייב ליצור מקס דיוריישן
+             worker.setUnemploymentTime(globalTime);
+         }
+ 
++        if (assignIdleAtStart) {
++            while (!copyTasksPQ.isEmpty() && !copyUnemployedQ.isEmpty()) {
++                Worker toGiveTask = new Worker(copyUnemployedQ.poll());
++                toGiveTask.setDesk(new GraphTaskNode(copyTasksPQ.poll()));
++                toGiveTask.setTaskEstimatedEndTime(toGiveTask.getDesk().getDuration() + globalTime);
++                copyWorkerPQ.add(toGiveTask);
++            }
++        }
++
+         while (nextWorkerTime < endOfTaskTime) {
+             if (!copyWorkerPQ.isEmpty()) {
+                 Worker currentWorker = new Worker(copyWorkerPQ.poll());
+@@ -246,6 +308,154 @@ public class DynamicScoreLogic { // חייב ליצור מקס דיוריישן
+         totalUnemployment = totalUnemployment + (minLeftDuration*numOfUnemployedAfter);
+         return totalUnemployment;
+     }
++
++    /** Index-based, read-only view of one task graph, used by the rollout simulation. */
++    static final class RolloutModel {
++        private final GraphTaskNode[] nodes;
++        private final HashMap<Integer, Integer> indexById;
++        private final int[] duration;
++        private final int[] bottomLevel;
++        private final int[][] children;
++        private final int[] rank;
++
++        RolloutModel(List<GraphTaskNode> topologicalSort) {
++            int n = topologicalSort.size();
++            nodes = topologicalSort.toArray(new GraphTaskNode[0]);
++            indexById = new HashMap<>(n * 2);
++            duration = new int[n];
++            bottomLevel = new int[n];
++            children = new int[n][];
++            for (int i = 0; i < n; i++) {
++                indexById.put(nodes[i].getId(), i);
++                duration[i] = nodes[i].getDuration();
++                bottomLevel[i] = nodes[i].getCriticalPaths();
++            }
++            for (int i = 0; i < n; i++) {
++                List<GraphTaskNode> ch = nodes[i].getChildren();
++                children[i] = new int[ch.size()];
++                for (int k = 0; k < ch.size(); k++) {
++                    children[i][k] = indexById.get(ch.get(k).getId());
++                }
++            }
++            // continuation priority: highest static score first, ties by task id
++            Integer[] order = new Integer[n];
++            for (int i = 0; i < n; i++) order[i] = i;
++            Arrays.sort(order, (a, b) -> {
++                int c = Double.compare(nodes[b].getScore(), nodes[a].getScore());
++                return c != 0 ? c : Integer.compare(nodes[a].getId(), nodes[b].getId());
++            });
++            rank = new int[n];
++            for (int r = 0; r < n; r++) rank[order[r]] = r;
++        }
++
++        private int index(GraphTaskNode node) {
++            return indexById.get(node.getId());
++        }
++    }
++
++    /**
++     * Rollout lookahead: starts {@code candidate} now, then continues with a
++     * deterministic static-priority list schedule (idle workers take ready tasks
++     * at once, simultaneous completions are applied together) for {@code depth}
++     * completion instants. Returns the exact makespan if the schedule finishes
++     * within the horizon, otherwise a lower bound on the final makespan of the
++     * reached state: max(critical-path bound of running and ready tasks,
++     * now + remaining work / workers).
++     *
++     * @param otherReady ready tasks other than the candidate
++     * @param employed   workers currently running a task (their desk and end time)
++     * @param idleWorkers workers free at {@code globalTime} besides the deciding one
++     */
++    int rolloutMakespan(
++            RolloutModel model,
++            GraphTaskNode candidate,
++            Collection<GraphTaskNode> otherReady,
++            Collection<Worker> employed,
++            int idleWorkers,
++            int globalTime,
++            int depth) {
++
++        int n = model.nodes.length;
++        int[] remaining = new int[n];
++        long unstartedWork = 0;
++        for (int i = 0; i < n; i++) {
++            GraphTaskNode g = model.nodes[i];
++            if (!g.isCompleted()) {
++                remaining[i] = g.getParentsRemained().size();
++                unstartedWork += model.duration[i];
++            }
++        }
++
++        // running tasks encoded as (end << 32 | index); ready tasks ordered by rank
++        PriorityQueue<Long> running = new PriorityQueue<>();
++        PriorityQueue<Integer> ready = new PriorityQueue<>((a, b) -> Integer.compare(model.rank[a], model.rank[b]));
++
++        for (Worker w : employed) {
++            if (w.getDesk() == null) continue;
++            int i = model.index(w.getDesk());
++            unstartedWork -= model.duration[i];
++            running.add(((long) w.getTaskEstimatedEndTime() << 32) | i);
++        }
++        int c = model.index(candidate);
++        unstartedWork -= model.duration[c];
++        running.add(((long) (globalTime + model.duration[c]) << 32) | c);
++        for (GraphTaskNode g : otherReady) {
++            ready.add(model.index(g));
++        }
++
++        int workers = running.size() + idleWorkers;
++        int free = idleWorkers;
++        int t = globalTime;
++        int events = 0;
++        while (true) {
++            while (free > 0 && !ready.isEmpty()) {
++                int j = ready.poll();
++                unstartedWork -= model.duration[j];
++                running.add(((long) (t + model.duration[j]) << 32) | j);
++                free--;
++            }
++            if (running.isEmpty()) {
++                return t;
++            }
++            if (events >= depth) {
++                return makespanLowerBound(model, running, ready, unstartedWork, workers, t);
++            }
++            t = (int) (running.peek() >>> 32);
++            while (!running.isEmpty() && (int) (running.peek() >>> 32) == t) {
++                int j = (int) (running.poll() & 0xffffffffL);
++                free++;
++                for (int ch : model.children[j]) {
++                    if (--remaining[ch] == 0) {
++                        ready.add(ch);
++                    }
++                }
++            }
++            events++;
++        }
++    }
++
++    private static int makespanLowerBound(
++            RolloutModel model,
++            PriorityQueue<Long> running,
++            PriorityQueue<Integer> ready,
++            long unstartedWork,
++            int workers,
++            int t) {
++
++        long work = unstartedWork;
++        long bound = t;
++        for (long r : running) {
++            int end = (int) (r >>> 32);
++            int j = (int) (r & 0xffffffffL);
++            work += end - t;
++            bound = Math.max(bound, (long) end + model.bottomLevel[j] - model.duration[j]);
++        }
++        for (int j : ready) {
++            bound = Math.max(bound, (long) t + model.bottomLevel[j]);
++        }
++        long workBound = t + (work + workers - 1) / workers;
++        return (int) Math.max(bound, workBound);
++    }
+ }
+ 
+ 
+diff --git a/src/main/java/backend/GraphTaskNode.java b/src/main/java/backend/GraphTaskNode.java
+index af8972d..cf3ab56 100644
+--- a/src/main/java/backend/GraphTaskNode.java
++++ b/src/main/java/backend/GraphTaskNode.java
+@@ -1,9 +1,16 @@
+ package backend;
+ 
++import java.util.BitSet;
+ import java.util.HashSet;
+ import java.util.LinkedList;
++import java.util.List;
+ 
+ public class GraphTaskNode {
++    // Compact reachability computed by TimeConstraints; reachableSet is built from
++    // it only when first requested. Both are null/unused until then.
++    private BitSet reachableBits;
++    private List<GraphTaskNode> reachableIndex;
++
+     private int id;
+     private String name;
+     private int duration;
+@@ -131,17 +138,61 @@ public class GraphTaskNode {
+     }
+ 
+     public HashSet<GraphTaskNode> getReachableSet() {
++        materializeReachableSet();
+         return this.reachableSet;
+     }
+ 
+     public void setReachableSet(HashSet<GraphTaskNode> other) {
++        this.reachableBits = null;
++        this.reachableIndex = null;
+         this.reachableSet = other;
+     }
+ 
+     public void addAllToReachableSet(GraphTaskNode task) {
++        materializeReachableSet();
+         this.reachableSet.addAll(task.getReachableSet());
+     }
+ 
++    /**
++     * Stores reachability as bits over {@code index}; the bit set is shared and
++     * never modified. getReachableSet() returns exactly the same set as the
++     * original eager HashSet computation.
++     */
++    void setReachableBits(BitSet bits, List<GraphTaskNode> index) {
++        this.reachableBits = bits;
++        this.reachableIndex = index;
++    }
++
++    /** Reachability as bits over {@code index}; the returned set must not be modified. */
++    BitSet reachableBitsOver(List<GraphTaskNode> index) {
++        if (reachableBits != null && reachableIndex == index) {
++            return reachableBits;
++        }
++        BitSet bits = new BitSet(index.size());
++        for (int i = 0; i < index.size(); i++) {
++            if (getReachableSet().contains(index.get(i))) {
++                bits.set(i);
++            }
++        }
++        return bits;
++    }
++
++    /** True while the reachable set still contains only this node and nothing else was recorded. */
++    boolean hasTrivialReachableSet() {
++        return reachableBits == null && reachableSet.size() == 1 && reachableSet.contains(this);
++    }
++
++    private void materializeReachableSet() {
++        if (reachableBits == null) {
++            return;
++        }
++        for (int i = reachableBits.nextSetBit(0); i >= 0; i = reachableBits.nextSetBit(i + 1)) {
++            reachableSet.add(reachableIndex.get(i));
++        }
++        reachableBits = null;
++        reachableIndex = null;
++    }
++
+     public int getCriticalPaths() {
+         return this.criticalPaths;
+     }
+@@ -183,6 +234,7 @@ public class GraphTaskNode {
+     }
+ 
+     public void removeReachable(GraphTaskNode toRemove) {
++        materializeReachableSet();
+         this.reachableSet.remove(toRemove);
+     }
+ 
+diff --git a/src/main/java/backend/TaskEngine.java b/src/main/java/backend/TaskEngine.java
+index 5b5247d..8662991 100644
+--- a/src/main/java/backend/TaskEngine.java
++++ b/src/main/java/backend/TaskEngine.java
+@@ -12,9 +12,29 @@ public class TaskEngine {
+     private double maxStaticScore;
+     private int maxDuration;
+     private int maxOpenChild;
++    private final SchedulerConfig config;
++    private final StaticGraphAnalysis analysis;
++    private DynamicScoreLogic.RolloutModel rolloutModel;
+ 
+ 
+     public TaskEngine(LinkedList<Task> tasks){
++        this(tasks, SchedulerConfig.DEFAULT);
++    }
++
++    public TaskEngine(LinkedList<Task> tasks, SchedulerConfig config){
++        this(tasks, config, null);
++    }
++
++    /**
++     * @param analysis precomputed weight-independent analysis of exactly these
++     *                 tasks, or null to compute it in initial()
++     */
++    public TaskEngine(LinkedList<Task> tasks, SchedulerConfig config, StaticGraphAnalysis analysis){
++        if (analysis != null && !analysis.matches(tasks)) {
++            throw new IllegalArgumentException("static analysis does not match the task list");
++        }
++        this.config = config;
++        this.analysis = analysis;
+         this.tasks = tasks;
+         maxDuration=0;
+         for (Task task : tasks) {
+@@ -86,12 +106,17 @@ public class TaskEngine {
+             );
+         }
+ 
+-        this.constraints = new TimeConstraints(nodesList, IDTable);
+-        readyPQ = new PriorityQueue<>((t1,t2)->Double.compare(t2.getScore(),t1.getScore()));
++        this.constraints = new TimeConstraints(nodesList, IDTable, config);
++        readyPQ = config.isDeterministicTieBreak()
++                ? new PriorityQueue<>((t1,t2)->{
++                    int c = Double.compare(t2.getScore(),t1.getScore());
++                    return c != 0 ? c : Integer.compare(t1.getId(), t2.getId());
++                })
++                : new PriorityQueue<>((t1,t2)->Double.compare(t2.getScore(),t1.getScore()));
+     }
+ 
+     public void initial(){
+-        constraints.initial(IDTable);
++        constraints.initial(IDTable, analysis);
+         for (GraphTaskNode task: constraints.getHeads()){
+             readyPQ.add(task);
+         }
+@@ -119,61 +144,46 @@ public class TaskEngine {
+ 
+         int originalPQSize = readyPQ.size();
+ 
+-        GraphTaskNode op1 = readyPQ.poll();
+-        GraphTaskNode op2 = readyPQ.poll();
+-        GraphTaskNode op3 = readyPQ.poll();
++        // candidate pool: the K best static scores (original K = 3)
++        int poolSize = Math.min(config.getCandidatePoolSize(), originalPQSize);
++        GraphTaskNode[] pool = new GraphTaskNode[poolSize];
++        for (int i = 0; i < poolSize; i++) {
++            pool[i] = readyPQ.poll();
++        }
++        GraphTaskNode op1 = pool[0];
++
++        GraphTaskNode[] tasksAr = new GraphTaskNode[poolSize];
++        double[] scores = new double[poolSize];
+ 
+-        GraphTaskNode[] tasksAr = new GraphTaskNode[3];
+-        double[] scores = new double[3];
++        int availableWorkers = config.isWorkloadUsesAvailableWorkers()
++                ? freeWorkersNow(employed, unemployed, globalTime)
++                : workersNum;
+ 
+         dynamicScoreChoose(
+-                op1,
+-                op2,
+-                op3,
++                pool,
+                 workersNum,
+                 scores,
+                 tasksAr,
+-                originalPQSize
++                originalPQSize,
++                availableWorkers
+         );
+ 
+         GraphTaskNode selected = tasksAr[0];
+ 
+-        if (tasksAr[1] != null
+-                && readyPQ.size() <= workersNum
+-                && Math.abs(scores[1] - scores[0]) > 0.1) {
+-
+-            PriorityQueue<GraphTaskNode> pqForFirst =
+-                    buildSimulationReadyQueue(tasksAr[0], tasksAr);
++        // The original gate counted the ready tasks left after removing the top 3;
++        // it is kept independent of K so that K alone does not change activation.
++        int readyBeyondTopThree = Math.max(0, originalPQSize - 3);
+ 
+-            double score0 =
+-                    scores[0]
+-                            + new DynamicScoreLogic().makeLookAhead(
+-                            tasksAr[0],
+-                            pqForFirst,
+-                            employed,
+-                            unemployed,
+-                            workersNum,
+-                            globalTime
+-                    );
+-
+-            PriorityQueue<GraphTaskNode> pqForSecond =
+-                    buildSimulationReadyQueue(tasksAr[1], tasksAr);
+-
+-            double score1 =
+-                    scores[1]
+-                            + new DynamicScoreLogic().makeLookAhead(
+-                            tasksAr[1],
+-                            pqForSecond,
+-                            employed,
+-                            unemployed,
+-                            workersNum,
+-                            globalTime
+-                    );
++        if (config.getLookaheadMode() != SchedulerConfig.LookaheadMode.NONE
++                && tasksAr.length > 1
++                && (!config.isLegacyLoadGate() || readyBeyondTopThree <= workersNum)
++                && (!config.isContestedDecisionsOnly()
++                        || originalPQSize > freeWorkersNow(employed, unemployed, globalTime))
++                && gapAllowsLookahead(Math.abs(scores[1] - scores[0]))) {
+ 
+-            selected =
+-                    score0 >= score1
+-                            ? tasksAr[0]
+-                            : tasksAr[1];
++            selected = config.getLookaheadMode() == SchedulerConfig.LookaheadMode.ROLLOUT
++                    ? rolloutLookahead(tasksAr, op1, employed, unemployed, globalTime)
++                    : legacyLookahead(tasksAr, scores, employed, unemployed, workersNum, globalTime);
+         }
+ 
+         for (GraphTaskNode candidate : tasksAr) {
+@@ -202,72 +212,156 @@ public class TaskEngine {
+         return simulationPQ;
+     }
+ 
+-    private void dynamicScoreChoose
+-            (GraphTaskNode op1, GraphTaskNode op2, GraphTaskNode op3,
+-             int workersNum, double[]scores, GraphTaskNode[]tasks,
+-             int originalPQSize)
+-    {
++    /**
++     * Original lookahead: blended score + mu * idle-window score; the first of the
++     * best candidates wins ties (with two candidates: score0 >= score1 keeps the first).
++     */
++    private GraphTaskNode legacyLookahead(
++            GraphTaskNode[] candidates,
++            double[] scores,
++            PriorityQueue<Worker> employed,
++            Queue<Worker> unemployed,
++            int workersNum,
++            int globalTime) {
+ 
+-        double op1DS =
+-                new DynamicScoreLogic().makeDynamicScore(
+-                        op1,
+-                        originalPQSize,
+-                        workersNum,
+-                        maxStaticScore,
+-                        maxDuration,
+-                        maxOpenChild);
+-        double op2DS =
+-                new DynamicScoreLogic().makeDynamicScore(
+-                        op2,
+-                        originalPQSize,
+-                        workersNum,
+-                        maxStaticScore,
+-                        maxDuration,
+-                        maxOpenChild);
+-        double op3DS = (op3 != null)
+-                ? new DynamicScoreLogic().makeDynamicScore(
+-                op3,
+-                originalPQSize,
+-                workersNum,
+-                maxStaticScore,
+-                maxDuration,
+-                maxOpenChild)
+-                : Double.NEGATIVE_INFINITY;
+-
+-        double op1TotalScore = (op1DS + op1.getScore()) / 2;
+-        tasks[0] = op1;
+-        scores[0] = op1TotalScore;
+-        double op2TotalScore = (op2DS + op2.getScore()) / 2;
+-        if (op2TotalScore>scores[0]) {
+-            scores[1] = scores[0];
+-            scores[0] = op2TotalScore;
+-            tasks[1] = tasks[0];
+-            tasks[0] = op2;
++        int count = lookaheadCandidateCount(candidates);
++        GraphTaskNode best = null;
++        double bestScore = 0;
++        for (int i = 0; i < count; i++) {
++            PriorityQueue<GraphTaskNode> pq = buildSimulationReadyQueue(candidates[i], candidates);
++            double lookahead = new DynamicScoreLogic(config).makeLookAhead(
++                    candidates[i],
++                    pq,
++                    employed,
++                    unemployed,
++                    workersNum,
++                    globalTime
++            );
++            if (config.isBoundedLookaheadScore()) {
++                lookahead = Math.max(0.0, Math.min(1.0, lookahead));
++            }
++            double score = scores[i] + config.getLookaheadWeight() * lookahead;
++            if (best == null || score > bestScore) {
++                best = candidates[i];
++                bestScore = score;
++            }
++        }
++        return best;
++    }
++
++    /**
++     * Rollout lookahead: every compared candidate is simulated for the same number
++     * of completion events and the smallest estimated makespan wins; ties keep
++     * the blended-score order.
++     */
++    private GraphTaskNode rolloutLookahead(
++            GraphTaskNode[] candidates,
++            GraphTaskNode staticBest,
++            PriorityQueue<Worker> employed,
++            Queue<Worker> unemployed,
++            int globalTime) {
++
++        if (rolloutModel == null) {
++            rolloutModel = new DynamicScoreLogic.RolloutModel(getTopologicalSort());
++        }
++        List<GraphTaskNode> compared = new ArrayList<>();
++        int count = lookaheadCandidateCount(candidates);
++        for (int i = 0; i < count; i++) {
++            compared.add(candidates[i]);
++        }
++        if (config.isRolloutIncludesStaticBest() && staticBest != null && !compared.contains(staticBest)) {
++            compared.add(staticBest);
++        }
++
++        DynamicScoreLogic logic = new DynamicScoreLogic(config);
++        GraphTaskNode best = null;
++        int bestMakespan = Integer.MAX_VALUE;
++        for (GraphTaskNode candidate : compared) {
++            int makespan = logic.rolloutMakespan(
++                    rolloutModel,
++                    candidate,
++                    buildSimulationReadyQueue(candidate, candidates),
++                    employed,
++                    unemployed.size(),
++                    globalTime,
++                    config.getRolloutDepth());
++            if (makespan < bestMakespan) {
++                best = candidate;
++                bestMakespan = makespan;
++            }
++        }
++        return best;
++    }
++
++    /** Workers able to start a task at globalTime: the deciding one, idle ones, and ones finishing now. */
++    private int freeWorkersNow(PriorityQueue<Worker> employed, Queue<Worker> unemployed, int globalTime) {
++        int free = 1 + unemployed.size();
++        for (Worker w : employed) {
++            if (w.getTaskEstimatedEndTime() == globalTime) {
++                free++;
++            }
+         }
+-        else{
+-            scores[1]=op2TotalScore;
+-            tasks[1]=op2;
++        return free;
++    }
++
++    private int lookaheadCandidateCount(GraphTaskNode[] candidates) {
++        int count = 0;
++        while (count < candidates.length && count < config.getLookaheadCandidates() && candidates[count] != null) {
++            count++;
+         }
+-        double op3TotalScore = (op3 != null) ? (op3DS + op3.getScore()) / 2 : Double.NEGATIVE_INFINITY;
+-        if (op3TotalScore!=Double.NEGATIVE_INFINITY) {
+-            if (op3TotalScore > scores[0]) {
+-                scores[2] = scores[1];
+-                scores[1] = scores[0];
+-                scores[0] = op3TotalScore;
+-                tasks[2] = tasks[1];
+-                tasks[1] = tasks[0];
+-                tasks[0] = op3;
+-            } else {
+-                if (op3TotalScore > scores[1]) {
+-                    scores[2] = scores[1];
+-                    scores[1] = op3TotalScore;
+-                    tasks[2] = tasks[1];
+-                    tasks[1] = op3;
+-                } else {
+-                    scores[2] = op3TotalScore;
+-                    tasks[2]=op3;
++        return count;
++    }
++
++    private boolean gapAllowsLookahead(double gap) {
++        return switch (config.getGapCondition()) {
++            case GAP_ABOVE_THRESHOLD -> gap > config.getLookaheadGapThreshold();
++            case GAP_AT_MOST_THRESHOLD -> gap <= config.getLookaheadGapThreshold();
++            case ANY_GAP -> true;
++        };
++    }
++
++    /** lambda * static + (1 - lambda) * dynamic; equals the original (dynamic + static) / 2 for lambda = 0.5. */
++    private double blendScore(double dynamicScore, double staticScore) {
++        double lambda = config.getStaticShare();
++        return lambda * staticScore + (1 - lambda) * dynamicScore;
++    }
++
++    /**
++     * Orders the pool by blended score, best first. A candidate moves ahead of an
++     * earlier one only with a strictly greater score, exactly as the original
++     * three-candidate insertion did (ties keep static-score order).
++     */
++    private void dynamicScoreChoose
++            (GraphTaskNode[] pool,
++             int workersNum, double[]scores, GraphTaskNode[]tasks,
++             int originalPQSize, int availableWorkers)
++    {
++        int placed = 0;
++        for (GraphTaskNode candidate : pool) {
++            double dynamicScore =
++                    new DynamicScoreLogic(config).makeDynamicScore(
++                            candidate,
++                            originalPQSize,
++                            workersNum,
++                            maxStaticScore,
++                            maxDuration,
++                            maxOpenChild,
++                            availableWorkers);
++            double total = blendScore(dynamicScore, candidate.getScore());
++            int position = placed;
++            for (int i = 0; i < placed; i++) {
++                if (total > scores[i]) {
++                    position = i;
++                    break;
+                 }
+             }
++            for (int i = placed; i > position; i--) {
++                scores[i] = scores[i - 1];
++                tasks[i] = tasks[i - 1];
++            }
++            scores[position] = total;
++            tasks[position] = candidate;
++            placed++;
+         }
+     }
+ 
+diff --git a/src/main/java/backend/TimeConstraints.java b/src/main/java/backend/TimeConstraints.java
+index 914530c..4b87ace 100644
+--- a/src/main/java/backend/TimeConstraints.java
++++ b/src/main/java/backend/TimeConstraints.java
+@@ -6,8 +6,15 @@ public class TimeConstraints {
+     private LinkedList<GraphTaskNode> heads;
+     private int taskTotalNum;
+     private ArrayList<GraphTaskNode> topologicalSort;
++    private final SchedulerConfig config;
+ 
+     public TimeConstraints(LinkedList<GraphTaskNode> tasks, HashMap<Integer, GraphTaskNode> IDTable) {
++        this(tasks, IDTable, SchedulerConfig.DEFAULT);
++    }
++
++    public TimeConstraints(LinkedList<GraphTaskNode> tasks, HashMap<Integer, GraphTaskNode> IDTable,
++                           SchedulerConfig config) {
++        this.config = config;
+         taskTotalNum = tasks.size();
+         heads = new LinkedList<>();
+         for (GraphTaskNode task : tasks) {
+@@ -55,6 +62,23 @@ public class TimeConstraints {
+     }
+ 
+     public void initial(HashMap<Integer, GraphTaskNode> IDTable) {
++        initial(IDTable, null);
++    }
++
++    /**
++     * With a precomputed analysis only the weight-dependent scoreSet runs; the
++     * critical paths, reachable durations and blocking power are copied.
++     */
++    void initial(HashMap<Integer, GraphTaskNode> IDTable, StaticGraphAnalysis analysis) {
++        if (analysis != null) {
++            analysis.applyTo(topologicalSort);
++            HashSet<Integer> visited = new HashSet<>(topologicalSort.size());
++            int reachDenominator = config.isReachNormalizedByMaximum()
++                    ? analysis.getMaxReachableDuration()
++                    : analysis.getTotalTime();
++            scoreSet(reachDenominator, analysis.getMaxCritical(), analysis.getMaxBlockingPower(), visited);
++            return;
++        }
+         criticalPaths();
+         int maxCritical = 0;
+         for (GraphTaskNode task : heads) {
+@@ -71,6 +95,14 @@ public class TimeConstraints {
+         HashSet<Integer> visited1 = new HashSet<>(topologicalSort.size());
+         double maxBlockPower = blockPower(visited1);
+ 
++        if (config.isReachNormalizedByMaximum()) {
++            int maxReach = 0;
++            for (GraphTaskNode node : topologicalSort) {
++                maxReach = Math.max(maxReach, node.getReachableDuration());
++            }
++            totalTime = maxReach;
++        }
++
+         HashSet<Integer> visited2 = new HashSet<>(topologicalSort.size());
+         scoreSet(totalTime, maxCritical, maxBlockPower, visited2);
+     }
+@@ -92,6 +124,19 @@ public class TimeConstraints {
+ 
+ 
+     public void reachableDuration() {
++        boolean trivial = true;
++        for (GraphTaskNode node : topologicalSort) {
++            if (!node.hasTrivialReachableSet()) {
++                trivial = false;
++                break;
++            }
++        }
++        if (trivial) {
++            reachableDurationBits();
++            return;
++        }
++        // Reachable sets were already populated by the caller: keep the original
++        // cumulative HashSet semantics exactly.
+         for (int i = topologicalSort.size() - 1; i >= 0; i--) {
+             GraphTaskNode current = topologicalSort.get(i);
+ 
+@@ -107,6 +152,35 @@ public class TimeConstraints {
+         }
+     }
+ 
++    /**
++     * Same result as the HashSet computation, using one bit set per task over the
++     * topological order (n^2/8 bytes instead of n^2 hash entries). Each node's
++     * reachable set is materialized from its bits only if someone asks for it.
++     */
++    private void reachableDurationBits() {
++        int n = topologicalSort.size();
++        HashMap<GraphTaskNode, Integer> index = new HashMap<>(n * 2);
++        for (int i = 0; i < n; i++) {
++            index.put(topologicalSort.get(i), i);
++        }
++        BitSet[] bits = new BitSet[n];
++        for (int i = n - 1; i >= 0; i--) {
++            GraphTaskNode current = topologicalSort.get(i);
++            BitSet reach = new BitSet(n);
++            reach.set(i);
++            for (GraphTaskNode child : current.getChildren()) {
++                reach.or(bits[index.get(child)]);
++            }
++            bits[i] = reach;
++            int sum = 0;
++            for (int k = reach.nextSetBit(0); k >= 0; k = reach.nextSetBit(k + 1)) {
++                sum = sum + topologicalSort.get(k).getDuration();
++            }
++            current.setReachableDuration(sum);
++            current.setReachableBits(reach, topologicalSort);
++        }
++    }
++
+     public double blockPower(HashSet<Integer>visited){
+         double maxNode = 0;
+         Queue<GraphTaskNode> q = new ArrayDeque<>();
+@@ -143,17 +217,17 @@ public class TimeConstraints {
+             double criticalPart =
+                     maxCritical == 0
+                             ? 0.0
+-                            : 0.5 * current.getCriticalPaths() / maxCritical;
++                            : config.getCriticalPathWeight() * current.getCriticalPaths() / maxCritical;
+ 
+             double blockPart =
+                     maxBlock == 0
+                             ? 0.0
+-                            : 0.25 * current.getBlockingPower() / maxBlock;
++                            : config.getBlockingPowerWeight() * current.getBlockingPower() / maxBlock;
+ 
+             double reachablePart =
+                     totalTime == 0
+                             ? 0.0
+-                            : 0.25 * current.getReachableDuration() / totalTime;
++                            : config.getReachableDurationWeight() * current.getReachableDuration() / totalTime;
+ 
+             current.setScore(
+                     criticalPart
+diff --git a/src/main/java/benchmark/BenchmarkEngine.java b/src/main/java/benchmark/BenchmarkEngine.java
+index 74794e7..733c4a0 100644
+--- a/src/main/java/benchmark/BenchmarkEngine.java
++++ b/src/main/java/benchmark/BenchmarkEngine.java
+@@ -19,6 +19,11 @@ import java.util.Set;
+  * Every benchmark assumes deterministic task durations and no runtime changes
+  * (no workers/tasks added or removed, and no early/late completion events).
+  * This makes the displayed makespans directly comparable.
++ *
++ * Completion semantics: the adaptive scheduler always uses the Controller's
++ * semantics (SchedulerConfig.getCompletionMode(), SEQUENTIAL by default). The
++ * greedy baselines use BATCHED semantics in benchmark(scenario) and the mode
++ * passed explicitly in the other overloads.
+  */
+ public final class BenchmarkEngine {
+ 
+@@ -52,15 +57,82 @@ public final class BenchmarkEngine {
+         return new BenchmarkReport(scenario.getName(), results);
+     }
+ 
++    /**
++     * Same as {@link #benchmark(ProjectScenario)}, but the adaptive scheduler uses
++     * {@code adaptiveConfig} and the greedy baselines process simultaneous
++     * completions according to {@code baselineMode}. The original overload uses
++     * {@link SchedulerConfig#DEFAULT} and BATCHED baselines.
++     */
++    public static BenchmarkReport benchmark(
++            ProjectScenario scenario,
++            SchedulerConfig adaptiveConfig,
++            SchedulerConfig.CompletionMode baselineMode) {
++
++        if (scenario == null) {
++            throw new IllegalArgumentException("scenario cannot be null");
++        }
++
++        EnumMap<BenchmarkStrategy, Integer> results =
++                new EnumMap<>(BenchmarkStrategy.class);
++
++        for (BenchmarkStrategy strategy : BenchmarkStrategy.values()) {
++            results.put(strategy, makespan(scenario, strategy, adaptiveConfig, baselineMode));
++        }
++
++        return new BenchmarkReport(scenario.getName(), results);
++    }
++
++    /**
++     * Makespan of one strategy. ADAPTIVE runs the real Controller with
++     * {@code adaptiveConfig}; every other strategy is a greedy list scheduler
++     * whose simultaneous completions follow {@code baselineMode}.
++     */
++    public static int makespan(
++            ProjectScenario scenario,
++            BenchmarkStrategy strategy,
++            SchedulerConfig adaptiveConfig,
++            SchedulerConfig.CompletionMode baselineMode) {
++
++        return makespan(scenario, strategy, adaptiveConfig, baselineMode, null);
++    }
++
++    /**
++     * As above, reusing a precomputed static analysis of the scenario's tasks
++     * (see StaticGraphAnalysis); null computes it per run.
++     */
++    public static int makespan(
++            ProjectScenario scenario,
++            BenchmarkStrategy strategy,
++            SchedulerConfig adaptiveConfig,
++            SchedulerConfig.CompletionMode baselineMode,
++            StaticGraphAnalysis analysis) {
++
++        if (strategy == BenchmarkStrategy.ADAPTIVE) {
++            return runAdaptiveScheduler(scenario, adaptiveConfig, analysis);
++        }
++        return runGreedyScheduler(scenario, strategy, baselineMode, analysis);
++    }
++
+     /**
+      * Uses the real Controller so the benchmarked Adaptive value is exactly the
+      * algorithm used by the live visualization.
+      */
+     private static int runAdaptiveScheduler(ProjectScenario scenario) {
++        return runAdaptiveScheduler(scenario, SchedulerConfig.DEFAULT);
++    }
++
++    private static int runAdaptiveScheduler(ProjectScenario scenario, SchedulerConfig config) {
++        return runAdaptiveScheduler(scenario, config, null);
++    }
++
++    private static int runAdaptiveScheduler(
++            ProjectScenario scenario, SchedulerConfig config, StaticGraphAnalysis analysis) {
+         Controller controller = new Controller(
+                 scenario.getTasks(),
+                 scenario.getWorkers(),
+-                false
++                false,
++                config,
++                analysis
+         );
+ 
+         controller.initial();
+@@ -81,6 +153,26 @@ public final class BenchmarkEngine {
+     private static int runGreedyScheduler(
+             ProjectScenario scenario,
+             BenchmarkStrategy strategy) {
++        return runGreedyScheduler(scenario, strategy, SchedulerConfig.CompletionMode.BATCHED);
++    }
++
++    /**
++     * BATCHED: every completion at the current time is applied before free
++     * workers choose (original behaviour). SEQUENTIAL: one completion is applied
++     * at a time and free workers choose immediately, mirroring Controller.
++     */
++    private static int runGreedyScheduler(
++            ProjectScenario scenario,
++            BenchmarkStrategy strategy,
++            SchedulerConfig.CompletionMode mode) {
++        return runGreedyScheduler(scenario, strategy, mode, null);
++    }
++
++    private static int runGreedyScheduler(
++            ProjectScenario scenario,
++            BenchmarkStrategy strategy,
++            SchedulerConfig.CompletionMode mode,
++            StaticGraphAnalysis analysis) {
+ 
+         if (strategy == BenchmarkStrategy.ADAPTIVE) {
+             throw new IllegalArgumentException(
+@@ -88,7 +180,7 @@ public final class BenchmarkEngine {
+         }
+ 
+         LinkedList<Task> taskCopies = scenario.getTasks();
+-        TaskEngine engine = new TaskEngine(taskCopies);
++        TaskEngine engine = new TaskEngine(taskCopies, SchedulerConfig.DEFAULT, analysis);
+         engine.initial();
+ 
+         Map<Integer, GraphTaskNode> nodes = new HashMap<>();
+@@ -120,11 +212,17 @@ public final class BenchmarkEngine {
+             ready.add(new ReadyTask(node, readySequence++));
+         }
+ 
++        // SEQUENTIAL processes equal finish times in assignment order, exactly like
++        // the Controller's worker queue (end time, then insertion order).
+         PriorityQueue<RunningTask> running = new PriorityQueue<>(
+-                Comparator.comparingInt(RunningTask::finishTime)
+-                        .thenComparingInt(RunningTask::workerId)
+-                        .thenComparingInt(RunningTask::taskId)
++                mode == SchedulerConfig.CompletionMode.SEQUENTIAL
++                        ? Comparator.comparingInt(RunningTask::finishTime)
++                                .thenComparingLong(RunningTask::assignment)
++                        : Comparator.comparingInt(RunningTask::finishTime)
++                                .thenComparingInt(RunningTask::workerId)
++                                .thenComparingInt(RunningTask::taskId)
+         );
++        long assignmentCounter = 0;
+ 
+         int workerCount = scenario.getWorkerCount();
+         int freeWorkers = workerCount;
+@@ -151,7 +249,8 @@ public final class BenchmarkEngine {
+                 running.add(new RunningTask(
+                         selected.node().getId(),
+                         workerId,
+-                        currentTime + selected.node().getDuration()
++                        currentTime + selected.node().getDuration(),
++                        assignmentCounter++
+                 ));
+                 freeWorkers--;
+             }
+@@ -166,9 +265,13 @@ public final class BenchmarkEngine {
+             currentTime = running.peek().finishTime();
+ 
+             List<RunningTask> finishingNow = new ArrayList<>();
+-            while (!running.isEmpty()
+-                    && running.peek().finishTime() == currentTime) {
++            if (mode == SchedulerConfig.CompletionMode.SEQUENTIAL) {
+                 finishingNow.add(running.poll());
++            } else {
++                while (!running.isEmpty()
++                        && running.peek().finishTime() == currentTime) {
++                    finishingNow.add(running.poll());
++                }
+             }
+ 
+             freeWorkers += finishingNow.size();
+@@ -285,6 +388,6 @@ public final class BenchmarkEngine {
+     private record ReadyTask(GraphTaskNode node, long readySequence) {
+     }
+ 
+-    private record RunningTask(int taskId, int workerId, int finishTime) {
++    private record RunningTask(int taskId, int workerId, int finishTime, long assignment) {
+     }
+ }

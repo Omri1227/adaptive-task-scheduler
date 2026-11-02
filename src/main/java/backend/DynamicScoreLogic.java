@@ -1,7 +1,10 @@
 package backend;
 
 import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Queue;
 
@@ -245,6 +248,159 @@ public class DynamicScoreLogic { // חייב ליצור מקס דיוריישן 
 
         totalUnemployment = totalUnemployment + (minLeftDuration*numOfUnemployedAfter);
         return totalUnemployment;
+    }
+
+    /**
+     * Index-based, read-only view of one task graph, used by the rollout lookahead.
+     * Durations, critical paths and static scores do not change after
+     * TaskEngine.initial(), so one model serves every decision of an engine.
+     */
+    static final class RolloutModel {
+        private final GraphTaskNode[] nodes;
+        private final HashMap<Integer, Integer> indexById;
+        private final int[] duration;
+        private final int[] bottomLevel;
+        private final int[][] children;
+        private final int[] rank;
+
+        RolloutModel(List<GraphTaskNode> topologicalSort) {
+            int n = topologicalSort.size();
+            nodes = topologicalSort.toArray(new GraphTaskNode[0]);
+            indexById = new HashMap<>(n * 2);
+            duration = new int[n];
+            bottomLevel = new int[n];
+            children = new int[n][];
+            for (int i = 0; i < n; i++) {
+                indexById.put(nodes[i].getId(), i);
+                duration[i] = nodes[i].getDuration();
+                bottomLevel[i] = nodes[i].getCriticalPaths();
+            }
+            for (int i = 0; i < n; i++) {
+                List<GraphTaskNode> ch = nodes[i].getChildren();
+                children[i] = new int[ch.size()];
+                for (int k = 0; k < ch.size(); k++) {
+                    children[i][k] = indexById.get(ch.get(k).getId());
+                }
+            }
+            // continuation priority: highest static score first, ties by task id
+            Integer[] order = new Integer[n];
+            for (int i = 0; i < n; i++) order[i] = i;
+            Arrays.sort(order, (a, b) -> {
+                int c = Double.compare(nodes[b].getScore(), nodes[a].getScore());
+                return c != 0 ? c : Integer.compare(nodes[a].getId(), nodes[b].getId());
+            });
+            rank = new int[n];
+            for (int r = 0; r < n; r++) rank[order[r]] = r;
+        }
+
+        private int index(GraphTaskNode node) {
+            return indexById.get(node.getId());
+        }
+    }
+
+    /**
+     * Rollout lookahead: starts {@code candidate} now, then continues with a
+     * deterministic static-priority list schedule (idle workers take ready tasks
+     * at once, simultaneous completions are applied together) for {@code depth}
+     * completion instants. Works on private copies only; no task, node or worker
+     * is modified. Returns the exact makespan if the schedule finishes within the
+     * horizon, otherwise a lower bound on the final makespan of the reached
+     * state: max(critical-path bound of running and ready tasks,
+     * now + remaining work / workers).
+     *
+     * @param otherReady  ready tasks other than the candidate
+     * @param employed    workers currently running a task (their desk and end time)
+     * @param idleWorkers workers free at {@code globalTime} besides the deciding one
+     */
+    int rolloutMakespan(
+            RolloutModel model,
+            GraphTaskNode candidate,
+            Collection<GraphTaskNode> otherReady,
+            Collection<Worker> employed,
+            int idleWorkers,
+            int globalTime,
+            int depth) {
+
+        int n = model.nodes.length;
+        int[] remaining = new int[n];
+        long unstartedWork = 0;
+        for (int i = 0; i < n; i++) {
+            GraphTaskNode g = model.nodes[i];
+            if (!g.isCompleted()) {
+                remaining[i] = g.getParentsRemained().size();
+                unstartedWork += model.duration[i];
+            }
+        }
+
+        // running tasks encoded as (end << 32 | index); ready tasks ordered by rank
+        PriorityQueue<Long> running = new PriorityQueue<>();
+        PriorityQueue<Integer> ready = new PriorityQueue<>((a, b) -> Integer.compare(model.rank[a], model.rank[b]));
+
+        for (Worker w : employed) {
+            if (w.getDesk() == null) continue;
+            int i = model.index(w.getDesk());
+            unstartedWork -= model.duration[i];
+            running.add(((long) w.getTaskEstimatedEndTime() << 32) | i);
+        }
+        int c = model.index(candidate);
+        unstartedWork -= model.duration[c];
+        running.add(((long) (globalTime + model.duration[c]) << 32) | c);
+        for (GraphTaskNode g : otherReady) {
+            ready.add(model.index(g));
+        }
+
+        int workers = running.size() + idleWorkers;
+        int free = idleWorkers;
+        int t = globalTime;
+        int events = 0;
+        while (true) {
+            while (free > 0 && !ready.isEmpty()) {
+                int j = ready.poll();
+                unstartedWork -= model.duration[j];
+                running.add(((long) (t + model.duration[j]) << 32) | j);
+                free--;
+            }
+            if (running.isEmpty()) {
+                return t;
+            }
+            if (events >= depth) {
+                return makespanLowerBound(model, running, ready, unstartedWork, workers, t);
+            }
+            t = (int) (running.peek() >>> 32);
+            while (!running.isEmpty() && (int) (running.peek() >>> 32) == t) {
+                int j = (int) (running.poll() & 0xffffffffL);
+                free++;
+                for (int ch : model.children[j]) {
+                    if (--remaining[ch] == 0) {
+                        ready.add(ch);
+                    }
+                }
+            }
+            events++;
+        }
+    }
+
+    private static int makespanLowerBound(
+            RolloutModel model,
+            PriorityQueue<Long> running,
+            PriorityQueue<Integer> ready,
+            long unstartedWork,
+            int workers,
+            int t) {
+
+        long work = unstartedWork;
+        long bound = t;
+        for (long r : running) {
+            int end = (int) (r >>> 32);
+            int j = (int) (r & 0xffffffffL);
+            work += end - t;
+            bound = Math.max(bound, (long) end + model.bottomLevel[j] - model.duration[j]);
+        }
+        for (int j : ready) {
+            bound = Math.max(bound, (long) t + model.bottomLevel[j]);
+        }
+        long workBound = t + (work + workers - 1) / workers;
+        return (int) Math.max(bound, workBound);
     }
 }
 

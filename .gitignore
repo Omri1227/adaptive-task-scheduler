@@ -4,3 +4,8 @@ out/
 target/
 .DS_Store
 Thumbs.db
+# Office lock files
+~$*
+
+# Raw research outputs (~100 MB); summarized in research/RESEARCH_REPORT.md
+research/raw-results/
